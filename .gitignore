@@ -1,0 +1,54 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+
+# Data files
+*.ser
+*.fits
+*.pcc
+*.pcc2
+*.dat
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and temp
+*.log
+*.tmp
+*.bak
+
+# Test outputs
+test_*.py
+speculative.txt
+
+# Generated
+sim_frame.c
+
+# Results / images (can regenerate)
+*.png
+stacker/
+
+# Experiment folder (separate project)
+experiment/
+
+# SDK info (conda package metadata)
+info/
+
+# Binary libraries (platform-specific, use install.sh)
+lib/
+
+# Misc
+x

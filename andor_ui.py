@@ -47,6 +47,7 @@ from andor import (
     AcquisitionMode, ReadMode, TriggerMode,
     SpuriousNoiseFilterMode, ErrorCode
 )
+from session import SessionManager
 import json
 from pathlib import Path
 
@@ -409,6 +410,11 @@ class AndorUI:
         self.batch_wait_temp = args.wait_temp if hasattr(args, 'wait_temp') else False
         self.batch_temp_ready = False
 
+        # Session management
+        data_dir = getattr(args, 'data_dir', '.')
+        self.session = SessionManager(data_dir)
+        self.session_active = False
+
         # Frame averaging
         self.show_average = False  # Toggle between live and averaged view
         self.avg_frame_count = 20  # Number of frames to average
@@ -626,11 +632,37 @@ class AndorUI:
         # Right side: Capture controls and stats
         right_widget = QtWidgets.QWidget()
         right_widget.setLayout(QtWidgets.QVBoxLayout())
-        right_widget.setFixedSize(400, 200)
+        right_widget.setFixedSize(400, 220)
 
-        # Filename
-        self.filename_edit = QtWidgets.QLineEdit(self.args.filename)
-        right_widget.layout().addWidget(self.filename_edit)
+        # Target and Filter row
+        target_row = QtWidgets.QWidget()
+        target_layout = QtWidgets.QHBoxLayout(target_row)
+        target_layout.setContentsMargins(0, 0, 0, 0)
+        target_layout.addWidget(QtWidgets.QLabel("Target:"))
+        self.target_edit = QtWidgets.QLineEdit(getattr(self.args, 'target', 'noname_target'))
+        self.target_edit.setPlaceholderText("e.g., M42")
+        self.target_edit.setFixedWidth(100)
+        target_layout.addWidget(self.target_edit)
+        target_layout.addWidget(QtWidgets.QLabel("Filter:"))
+        self.filter_edit = QtWidgets.QLineEdit(getattr(self.args, 'filter', ''))
+        self.filter_edit.setPlaceholderText("e.g., Ha")
+        self.filter_edit.setFixedWidth(60)
+        target_layout.addWidget(self.filter_edit)
+        target_layout.addStretch()
+        right_widget.layout().addWidget(target_row)
+
+        # Data directory with disk space
+        data_row = QtWidgets.QWidget()
+        data_layout = QtWidgets.QHBoxLayout(data_row)
+        data_layout.setContentsMargins(0, 0, 0, 0)
+        data_layout.addWidget(QtWidgets.QLabel("Data:"))
+        self.data_dir_edit = QtWidgets.QLineEdit(getattr(self.args, 'data_dir', '.'))
+        self.data_dir_edit.setFixedWidth(150)
+        data_layout.addWidget(self.data_dir_edit)
+        self.disk_space_label = QtWidgets.QLabel("Disk: --")
+        data_layout.addWidget(self.disk_space_label)
+        data_layout.addStretch()
+        right_widget.layout().addWidget(data_row)
 
         # Format selection
         format_widget = QtWidgets.QWidget()
@@ -868,14 +900,34 @@ class AndorUI:
     def toggle_capture(self):
         """Toggle capture on/off."""
         if not self.capture_state:
+            # Check disk space before starting
+            can_capture, msg = self._check_disk_space()
+            if not can_capture:
+                print(f"[CAPTURE] Cannot start: {msg}")
+                QtWidgets.QMessageBox.warning(self.win, "Disk Space", msg)
+                return
+
+            # Start or resume session
+            if not self.session_active:
+                self._start_session()
+
             self.capture_state = True
             self.capture_button.setText("Stop Capture")
             self.cnt = 0
 
-            # Start SER file if in SER mode
+            # Generate filename using session
             if self.save_as_ser:
-                fn = f"{self.filename_edit.text()}{time.time_ns()}.ser"
+                if self.session_active:
+                    filepath = self.session.get_capture_path(
+                        prefix=self.target_edit.text() or "capture",
+                        extension=".ser"
+                    )
+                    fn = str(filepath)
+                else:
+                    fn = f"{self.filename_edit.text()}{time.time_ns()}.ser"
+
                 self.ser_writer = SerWriter(fn)
+                self.current_capture_path = Path(fn)
                 # Determine depth: 2 bytes for uint16
                 depth = 2 if self.array.dtype == np.uint16 else 1
                 self.ser_writer.set_sizes(self.sx, self.sy, depth)
@@ -887,8 +939,109 @@ class AndorUI:
             # Close SER file if active
             if self.ser_writer is not None:
                 self.ser_writer.close()
-                print(f"SER closed: {self.ser_writer.count} frames")
+                frames = self.ser_writer.count
+                print(f"SER closed: {frames} frames")
+
+                # Log capture to session
+                if self.session_active and hasattr(self, 'current_capture_path'):
+                    size = self.current_capture_path.stat().st_size if self.current_capture_path.exists() else 0
+                    self.session.log_capture(self.current_capture_path, int(frames), int(size))
+                    print(f"[SESSION] Logged: {self.current_capture_path.name} ({frames} frames, {size/(1024*1024):.1f} MB)")
+
                 self.ser_writer = None
+
+    def _roll_ser_file(self):
+        """Close current SER file and start a new one."""
+        if self.ser_writer is None:
+            return
+
+        # Close current file
+        self.ser_writer.close()
+        frames = self.ser_writer.count
+        print(f"SER closed: {frames} frames")
+
+        # Log to session
+        if self.session_active and hasattr(self, 'current_capture_path'):
+            size = self.current_capture_path.stat().st_size if self.current_capture_path.exists() else 0
+            self.session.log_capture(self.current_capture_path, int(frames), int(size))
+            print(f"[SESSION] Logged: {self.current_capture_path.name} ({frames} frames, {size/(1024*1024):.1f} MB)")
+
+        # Reset frame counter
+        self.cnt = 0
+
+        # Open new file
+        if self.session_active:
+            filepath = self.session.get_capture_path(
+                prefix=self.target_edit.text() or "capture",
+                extension=".ser"
+            )
+            fn = str(filepath)
+        else:
+            fn = f"{self.filename_edit.text()}{time.time_ns()}.ser"
+
+        self.ser_writer = SerWriter(fn)
+        self.current_capture_path = Path(fn)
+        depth = 2 if self.array.dtype == np.uint16 else 1
+        self.ser_writer.set_sizes(self.sx, self.sy, depth)
+        print(f"Recording SER: {fn}")
+
+    def _start_session(self):
+        """Start a new acquisition session."""
+        target = self.target_edit.text().strip()
+        filter_name = self.filter_edit.text().strip() or None
+
+        # Update session manager base path from UI
+        self.session.base_path = Path(self.data_dir_edit.text()).resolve()
+
+        # Get camera settings for logging
+        camera_settings = {
+            "exposure": self.worker.exposure_time,
+            "em_gain": self.worker.em_gain,
+            "temperature": self.target_temp_spinbox.value(),
+            "width": self.sx,
+            "height": self.sy
+        }
+
+        session_dir = self.session.start_session(target, filter_name, camera_settings)
+        self.session_active = True
+        print(f"[SESSION] Started: {session_dir}")
+
+    def _end_session(self, notes: str = ""):
+        """End the current session."""
+        if self.session_active:
+            summary = self.session.end_session(notes)
+            self.session_active = False
+            print(f"[SESSION] Ended: {summary.get('total_frames', 0)} frames, {summary.get('total_size_mb', 0):.1f} MB")
+
+    def _check_disk_space(self) -> tuple:
+        """Check disk space and return (can_proceed, message)."""
+        # Update session base path from UI
+        self.session.base_path = Path(self.data_dir_edit.text()).resolve()
+
+        # Check if we have a batch target for size estimation
+        if self.batch_capture_target > 0:
+            return self.session.can_capture(self.batch_capture_target, self.sx, self.sy)
+        else:
+            # Just check available space
+            available_gb, status = self.session.check_disk_space()
+            if status == "critical":
+                return (False, f"Critical: only {available_gb:.1f} GB available")
+            elif status == "warning":
+                return (True, f"Warning: only {available_gb:.1f} GB available")
+            return (True, f"OK: {available_gb:.1f} GB available")
+
+    def _update_disk_space_display(self):
+        """Update the disk space label."""
+        available_gb, status = self.session.check_disk_space()
+        if status == "critical":
+            self.disk_space_label.setText(f"Disk: {available_gb:.0f}GB ⚠️")
+            self.disk_space_label.setStyleSheet("color: red;")
+        elif status == "warning":
+            self.disk_space_label.setText(f"Disk: {available_gb:.0f}GB")
+            self.disk_space_label.setStyleSheet("color: orange;")
+        else:
+            self.disk_space_label.setText(f"Disk: {available_gb:.0f}GB")
+            self.disk_space_label.setStyleSheet("")
 
     def apply_calibration(self, frame):
         """Apply dark subtraction and flat field correction."""
@@ -941,9 +1094,12 @@ class AndorUI:
                 self._batch_complete()
                 return
 
-            # Only auto-stop for FITS mode; SER records until user stops
-            if not self.save_as_ser and self.cnt >= self.frame_per_file:
-                self.toggle_capture()
+            # Roll to new file after frame_per_file frames
+            if self.cnt >= self.frame_per_file:
+                if self.save_as_ser:
+                    self._roll_ser_file()
+                else:
+                    self.toggle_capture()  # FITS: stop and restart
 
         # Throttled display update - schedule if not already pending
         self._pending_frame = frame
@@ -1008,6 +1164,8 @@ class AndorUI:
         self.temperature = temp
         self.temp_status = status
         self.temp_label.setText(f"{temp:.1f} °C ({status})")
+        # Update disk space periodically (piggyback on temp updates)
+        self._update_disk_space_display()
 
     def update_display(self):
         """Update the image display and stats."""
@@ -1269,12 +1427,12 @@ class AndorUI:
     def _batch_complete(self):
         """Called when batch capture is complete."""
         print(f"[BATCH] Capture complete: {self.batch_frames_captured} frames saved")
+
+        # End session
+        if self.session_active:
+            self._end_session()
+
         print("[BATCH] Closing application...")
-        # Close SER file if open
-        if self.ser_writer is not None:
-            self.ser_writer.close()
-            print(f"[BATCH] SER file closed: {self.ser_writer.count} frames")
-            self.ser_writer = None
         # Schedule application quit
         QTimer.singleShot(500, self.win.close)
 
@@ -1293,6 +1451,10 @@ class AndorUI:
             self.ser_writer.close()
             print(f"SER closed on exit: {self.ser_writer.count} frames")
             self.ser_writer = None
+
+        # End session if active
+        if self.session_active:
+            self._end_session()
 
         # Note: We do NOT turn off the cooler here - it keeps running
         # Only gradual shutdown turns it off
@@ -1368,9 +1530,17 @@ Keyboard shortcuts:
     parser.add_argument("--ser", action="store_true",
                         help="Use SER format instead of FITS for capture")
 
+    # Session/data management
+    parser.add_argument("--target", type=str, default="noname_target",
+                        help="Target name (e.g., M42, NGC7000)")
+    parser.add_argument("--filter", type=str, default="",
+                        help="Filter name (e.g., Ha, OIII, L)")
+    parser.add_argument("--data-dir", type=str, default=".",
+                        help="Base directory for data (default: current dir)")
+
     # Batch/scripted capture mode
-    parser.add_argument("--capture", type=int, default=0, metavar="N",
-                        help="Capture N total frames then exit (0=interactive mode)")
+    parser.add_argument("--capture", type=int, default=500000, metavar="N",
+                        help="Capture N total frames then exit (default: 500000)")
     parser.add_argument("--auto-start", action="store_true",
                         help="Start capturing immediately on startup")
     parser.add_argument("--wait-temp", action="store_true",

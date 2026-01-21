@@ -1,0 +1,9 @@
+numpy
+scipy
+astropy
+PyQt5
+opencv-python
+numba
+Cython
+pylablib
+matplotlib
