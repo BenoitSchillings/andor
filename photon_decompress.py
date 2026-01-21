@@ -20,7 +20,7 @@ from ser import SerWriter
 sys.stdout.reconfigure(line_buffering=True)
 
 MAGIC = b'PCC2'
-MODE_NAMES = {1: 'binary', 2: 'multilevel'}
+MODE_NAMES = {0: 'lossless', 1: 'binary', 2: 'hybrid'}
 
 
 def unpack_bits(packed_bytes, shape):
@@ -82,13 +82,18 @@ def main():
             compressed = f.read(chunk_sizes[i])
             raw = zlib.decompress(compressed)
 
-            if mode == 1:  # binary
+            if mode == 0:  # lossless
+                # Stored as int16, convert to uint16 with offset
+                frame_int = np.frombuffer(raw, dtype=np.int16).reshape(height, width)
+                # Add offset to make non-negative (bias-subtracted values can be negative)
+                frame = (frame_int.astype(np.int32) + 1000).clip(0, 65535).astype(np.uint16)
+            elif mode == 1:  # binary
                 frame = unpack_bits(raw, (height, width))
                 if args.raw:
                     frame = frame.astype(np.uint16)
                 else:
                     frame = (frame * 65535).astype(np.uint16)
-            else:  # multilevel
+            else:  # hybrid
                 counts = np.frombuffer(raw, dtype=np.uint8).reshape(height, width)
                 if args.raw:
                     # Raw photon counts (0, 1, 2, 3...)

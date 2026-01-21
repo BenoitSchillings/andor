@@ -23,6 +23,7 @@ from datetime import datetime
 import argparse
 import sys
 import json
+import configparser
 
 try:
     import cv2
@@ -94,8 +95,18 @@ from util import (
     filter_outliers_simple
 )
 from ser import SerWriter
-from skyx import SkyXConnection, sky6RASCOMTele, sky6FilterWheel
-from scope import init_scope, get_scope
+from skyx import sky6RASCOMTele, SkyxConnectionError
+from scipy.ndimage import gaussian_filter
+
+# Focuser support (optional)
+try:
+    from fli_focuser import focuser as FLIFocuser
+    HAS_FOCUSER = True
+except ImportError:
+    HAS_FOCUSER = False
+except Exception as e:
+    print(f"Focuser not available: {e}")
+    HAS_FOCUSER = False
 
 
 # ============================================================================
@@ -420,11 +431,15 @@ class AndorUI:
         self.avg_frame_count = 20  # Number of frames to average
         self._frame_buffer = []  # Circular buffer for averaging
 
-        # Telescope/mount control via scope module
-        if init_scope():
-            self.scope = get_scope()
+        # Telescope/mount control via TheSkyX
+        try:
+            self.scope = sky6RASCOMTele()
+            self.scope.Connect()
             print("Scope: connected to mount")
-        else:
+        except SkyxConnectionError as e:
+            self.scope = None
+            print(f"Scope: Failed to connect to TheSkyX: {e}")
+        except Exception as e:
             self.scope = None
             print("Scope: not available")
 
@@ -1242,7 +1257,11 @@ class AndorUI:
         if self._scope_update_counter >= 30:
             self._scope_update_counter = 0
             if self.scope and self.scope.is_connected():
-                ra, dec = self.scope.get_radec()
+                try:
+                    radec = self.scope.GetRaDec()
+                    ra, dec = float(radec[0]), float(radec[1])
+                except (IndexError, ValueError, SkyxConnectionError):
+                    ra, dec = None, None
                 if ra is not None and dec is not None:
                     # Convert RA from hours to H:M:S
                     ra_h = int(ra)
@@ -1310,8 +1329,18 @@ class AndorUI:
 
     def mainloop(self):
         """Main event loop."""
+        # Schedule autofocus if requested (after UI is up and frames are flowing)
+        if self.args.autofocus:
+            QTimer.singleShot(2000, self._run_autofocus_async)
+
         app = QtWidgets.QApplication.instance()
         app.exec_()
+
+    def _run_autofocus_async(self):
+        """Run autofocus in a separate thread to avoid blocking the UI."""
+        import threading
+        af_thread = threading.Thread(target=self.run_autofocus, daemon=True)
+        af_thread.start()
 
     def _load_config(self):
         """Load saved configuration (target temp, cooler state)."""
@@ -1436,6 +1465,267 @@ class AndorUI:
         # Schedule application quit
         QTimer.singleShot(500, self.win.close)
 
+    # ========================================================================
+    # Autofocus
+    # ========================================================================
+
+    def load_autofocus_config(self):
+        """Load autofocus parameters from detector.ini."""
+        config = configparser.ConfigParser()
+        config_path = Path(__file__).parent / "detector.ini"
+        config.read(config_path)
+
+        af = {}
+        if config.has_section('Autofocus'):
+            af['min_brightness'] = config.getint('Autofocus', 'MinBrightness', fallback=10000)
+            af['samples_per_position'] = config.getint('Autofocus', 'SamplesPerPosition', fallback=25)
+            af['step_size'] = config.getint('Autofocus', 'StepSize', fallback=50)
+            af['positions_per_direction'] = config.getint('Autofocus', 'PositionsPerDirection', fallback=4)
+            af['max_travel'] = config.getint('Autofocus', 'MaxTravel', fallback=400)
+            af['roi_size'] = config.getint('Autofocus', 'ROISize', fallback=20)
+        else:
+            # Defaults
+            af = {
+                'min_brightness': 10000,
+                'samples_per_position': 25,
+                'step_size': 50,
+                'positions_per_direction': 4,
+                'max_travel': 400,
+                'roi_size': 20
+            }
+        return af
+
+    def find_brightest_star(self, frame):
+        """Find brightest star in frame using Gaussian filtering."""
+        filtered = gaussian_filter(frame.astype(float), sigma=2)
+        y, x = np.unravel_index(np.argmax(filtered), filtered.shape)
+        brightness = filtered[y, x]
+        return y, x, brightness
+
+    def extract_star_roi(self, frame, y, x, roi_size):
+        """Extract ROI around star position."""
+        y1 = max(0, y - roi_size)
+        y2 = min(frame.shape[0], y + roi_size)
+        x1 = max(0, x - roi_size)
+        x2 = min(frame.shape[1], x + roi_size)
+        roi = frame[y1:y2, x1:x2].copy()
+        # Subtract background
+        roi = roi.astype(float) - np.min(roi)
+        return roi
+
+    def measure_hfd_at_position(self, af_config, focuser_obj):
+        """
+        Measure HFD at current focus position by averaging multiple samples.
+        Returns (mean_hfd, std_hfd) or (None, None) if star lost.
+        """
+        hfd_samples = []
+        roi_size = af_config['roi_size']
+        min_brightness = af_config['min_brightness']
+        samples_needed = af_config['samples_per_position']
+
+        # Wait for focuser to settle
+        time.sleep(0.3)
+
+        attempts = 0
+        max_attempts = samples_needed * 3  # Allow some failed frames
+
+        while len(hfd_samples) < samples_needed and attempts < max_attempts:
+            attempts += 1
+
+            # Get a frame - use the most recent frame from the display
+            frame = self.array.copy()
+
+            # Find star
+            y, x, brightness = self.find_brightest_star(frame)
+
+            if brightness < min_brightness:
+                continue  # Skip this frame
+
+            # Extract ROI and compute HFD
+            roi = self.extract_star_roi(frame, y, x, roi_size)
+            if roi.size == 0:
+                continue
+
+            hfd = compute_hfd(roi)
+            if hfd > 0 and hfd < 50:  # Sanity check
+                hfd_samples.append(hfd)
+
+            # Small delay between samples
+            time.sleep(0.05)
+
+        if len(hfd_samples) < samples_needed // 2:
+            return None, None  # Not enough valid samples
+
+        # Filter outliers and compute mean
+        hfd_array = np.array(hfd_samples)
+        mean_hfd = np.mean(hfd_array)
+        std_hfd = np.std(hfd_array)
+
+        return mean_hfd, std_hfd
+
+    def run_autofocus(self):
+        """
+        Run the autofocus routine.
+        Returns True if successful, False otherwise.
+        """
+        print("\n" + "=" * 60)
+        print("AUTOFOCUS STARTING")
+        print("=" * 60)
+
+        if not HAS_FOCUSER:
+            print("ERROR: Focuser not available")
+            return False
+
+        # Load config
+        af_config = self.load_autofocus_config()
+        print(f"Config: step={af_config['step_size']}, "
+              f"positions={af_config['positions_per_direction']}/dir, "
+              f"samples={af_config['samples_per_position']}")
+
+        # Initialize focuser
+        try:
+            foc = FLIFocuser()
+            start_position = foc.get_abs_pos()
+            print(f"Focuser connected, start position: {start_position}")
+        except Exception as e:
+            print(f"ERROR: Could not connect to focuser: {e}")
+            return False
+
+        # Wait for some frames to arrive
+        print("Waiting for frames...")
+        time.sleep(1.0)
+
+        # Check for bright star
+        frame = self.array.copy()
+        y, x, brightness = self.find_brightest_star(frame)
+        print(f"Brightest star at ({x}, {y}) with brightness {brightness:.0f} ADU")
+
+        if brightness < af_config['min_brightness']:
+            print(f"ERROR: Star too faint ({brightness:.0f} < {af_config['min_brightness']} ADU)")
+            print("AUTOFOCUS ABORTED")
+            return False
+
+        # Measure baseline HFD
+        print("\nMeasuring baseline HFD...")
+        baseline_hfd, baseline_std = self.measure_hfd_at_position(af_config, foc)
+        if baseline_hfd is None:
+            print("ERROR: Could not measure baseline HFD")
+            return False
+        print(f"Baseline HFD: {baseline_hfd:.2f} ± {baseline_std:.2f}")
+
+        # Collect measurements at multiple positions
+        measurements = [(start_position, baseline_hfd)]
+        step_size = af_config['step_size']
+        n_positions = af_config['positions_per_direction']
+
+        # Scan positive direction
+        print(f"\nScanning +direction ({n_positions} positions)...")
+        current_pos = start_position
+        for i in range(n_positions):
+            foc.move_focus(step_size)
+            current_pos += step_size
+            print(f"  Position {current_pos}: ", end="", flush=True)
+
+            hfd, std = self.measure_hfd_at_position(af_config, foc)
+            if hfd is not None:
+                measurements.append((current_pos, hfd))
+                print(f"HFD = {hfd:.2f} ± {std:.2f}")
+            else:
+                print("FAILED (star lost)")
+                break
+
+        # Return to start
+        print("\nReturning to start position...")
+        foc.move_to(start_position)
+        time.sleep(0.5)
+
+        # Scan negative direction
+        print(f"\nScanning -direction ({n_positions} positions)...")
+        current_pos = start_position
+        for i in range(n_positions):
+            foc.move_focus(-step_size)
+            current_pos -= step_size
+            print(f"  Position {current_pos}: ", end="", flush=True)
+
+            hfd, std = self.measure_hfd_at_position(af_config, foc)
+            if hfd is not None:
+                measurements.append((current_pos, hfd))
+                print(f"HFD = {hfd:.2f} ± {std:.2f}")
+            else:
+                print("FAILED (star lost)")
+                break
+
+        # Need at least 3 points for parabola fit
+        if len(measurements) < 3:
+            print("\nERROR: Not enough measurements for parabola fit")
+            print("Returning to start position...")
+            foc.move_to(start_position)
+            return False
+
+        # Fit parabola: HFD = a*pos^2 + b*pos + c
+        print(f"\nFitting parabola to {len(measurements)} points...")
+        positions = np.array([m[0] for m in measurements])
+        hfds = np.array([m[1] for m in measurements])
+
+        # Polynomial fit (degree 2)
+        coeffs = np.polyfit(positions, hfds, 2)
+        a, b, c = coeffs
+
+        # Check parabola opens upward (a > 0)
+        if a <= 0:
+            print("WARNING: Parabola opens downward - focus curve may be invalid")
+            print("Returning to start position...")
+            foc.move_to(start_position)
+            return False
+
+        # Find minimum: derivative = 2*a*pos + b = 0 => pos = -b/(2*a)
+        best_position = int(-b / (2 * a))
+        predicted_hfd = a * best_position**2 + b * best_position + c
+
+        print(f"Parabola: HFD = {a:.6f}*pos² + {b:.4f}*pos + {c:.2f}")
+        print(f"Predicted best position: {best_position}")
+        print(f"Predicted HFD: {predicted_hfd:.2f}")
+
+        # Check if best position is within limits
+        if abs(best_position - start_position) > af_config['max_travel']:
+            print(f"WARNING: Best position exceeds max travel limit")
+            best_position = start_position + np.sign(best_position - start_position) * af_config['max_travel']
+            print(f"Clamping to: {best_position}")
+
+        # Move to best position
+        print(f"\nMoving to best position: {best_position}")
+        foc.move_to(best_position)
+
+        # Final verification
+        print("Verifying final HFD...")
+        final_hfd, final_std = self.measure_hfd_at_position(af_config, foc)
+        if final_hfd is None:
+            print("ERROR: Could not measure final HFD")
+            print("Returning to start position...")
+            foc.move_to(start_position)
+            return False
+
+        print(f"Final HFD: {final_hfd:.2f} ± {final_std:.2f}")
+
+        # Compare to baseline
+        if final_hfd >= baseline_hfd:
+            print(f"\nNo improvement (final {final_hfd:.2f} >= baseline {baseline_hfd:.2f})")
+            print("Returning to start position...")
+            foc.move_to(start_position)
+            print("\n" + "=" * 60)
+            print("AUTOFOCUS COMPLETE - NO IMPROVEMENT")
+            print("=" * 60 + "\n")
+            return False
+
+        improvement = ((baseline_hfd - final_hfd) / baseline_hfd) * 100
+        print(f"\nImprovement: {improvement:.1f}% (HFD: {baseline_hfd:.2f} -> {final_hfd:.2f})")
+        print(f"Best focus position: {best_position}")
+        print("\n" + "=" * 60)
+        print("AUTOFOCUS COMPLETE - SUCCESS")
+        print("=" * 60 + "\n")
+
+        return True
+
     def _cleanup(self):
         """Cleanup on exit."""
         # Save config before exiting (preserves cooler state unless shutdown was done)
@@ -1545,6 +1835,10 @@ Keyboard shortcuts:
                         help="Start capturing immediately on startup")
     parser.add_argument("--wait-temp", action="store_true",
                         help="Wait for temperature to stabilize before capturing")
+
+    # Autofocus
+    parser.add_argument("--autofocus", action="store_true",
+                        help="Run autofocus routine before starting")
 
     args = parser.parse_args()
 
