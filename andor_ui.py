@@ -120,7 +120,7 @@ class CameraWorker(QObject):
 
     new_frame_ready = pyqtSignal(object)
     exposure_started = pyqtSignal(float)
-    temperature_updated = pyqtSignal(float, str)
+    temperature_updated = pyqtSignal(float, float, float, float, str)  # sensor, target, ambient, volts, status
 
     def __init__(self, camera):
         super().__init__()
@@ -169,7 +169,7 @@ class CameraWorker(QObject):
                     self._temp_counter = 0
 
                 if self._temp_counter % 50 == 0:
-                    temp, status = self.camera.get_temperature()
+                    sensor, target, ambient, volts, status = self.camera.get_temperature_status()
                     status_map = {
                         ErrorCode.DRV_TEMPERATURE_OFF: "Off",
                         ErrorCode.DRV_TEMPERATURE_STABILIZED: "Stabilized",
@@ -177,7 +177,7 @@ class CameraWorker(QObject):
                         ErrorCode.DRV_TEMPERATURE_NOT_REACHED: "Cooling...",
                         ErrorCode.DRV_TEMPERATURE_DRIFT: "Drift",
                     }
-                    self.temperature_updated.emit(temp, status_map.get(status, "Unknown"))
+                    self.temperature_updated.emit(sensor, target, ambient, volts, status_map.get(status, "Unknown"))
 
                 # Check if we need to restart acquisition (e.g., exposure or gain changed)
                 if self.restart_needed:
@@ -216,7 +216,7 @@ class CameraWorker(QObject):
                     self.new_frame_ready.emit(frame)
 
                     # Update temperature
-                    temp, status = self.camera.get_temperature()
+                    sensor, target, ambient, volts, status = self.camera.get_temperature_status()
                     status_map = {
                         ErrorCode.DRV_TEMPERATURE_OFF: "Off",
                         ErrorCode.DRV_TEMPERATURE_STABILIZED: "Stabilized",
@@ -224,7 +224,7 @@ class CameraWorker(QObject):
                         ErrorCode.DRV_TEMPERATURE_NOT_REACHED: "Cooling...",
                         ErrorCode.DRV_TEMPERATURE_DRIFT: "Drift",
                     }
-                    self.temperature_updated.emit(temp, status_map.get(status, "Unknown"))
+                    self.temperature_updated.emit(sensor, target, ambient, volts, status_map.get(status, "Unknown"))
 
     def stop_capture(self):
         """Stop the frame capture loop."""
@@ -1174,11 +1174,11 @@ class AndorUI:
         else:
             self.exposure_timer.stop()
 
-    def update_temperature(self, temp, status):
+    def update_temperature(self, sensor, target, ambient, volts, status):
         """Update temperature display."""
-        self.temperature = temp
+        self.temperature = sensor
         self.temp_status = status
-        self.temp_label.setText(f"{temp:.1f} °C ({status})")
+        self.temp_label.setText(f"{sensor:.1f} °C ({status})")
         # Update disk space periodically (piggyback on temp updates)
         self._update_disk_space_display()
 

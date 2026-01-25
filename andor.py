@@ -495,6 +495,9 @@ def _setup_function_signatures(lib: ctypes.CDLL) -> None:
     lib.GetTemperatureF.argtypes = [POINTER(c_float)]
     lib.GetTemperatureF.restype = c_uint
 
+    lib.GetTemperatureStatus.argtypes = [POINTER(c_float), POINTER(c_float), POINTER(c_float), POINTER(c_float)]
+    lib.GetTemperatureStatus.restype = c_uint
+
     lib.GetTemperatureRange.argtypes = [POINTER(c_int), POINTER(c_int)]
     lib.GetTemperatureRange.restype = c_uint
 
@@ -1008,6 +1011,30 @@ class AndorCamera:
         temp = c_float()
         code = _lib.GetTemperatureF(byref(temp))
         return (temp.value, code)
+
+    def get_temperature_status(self) -> Tuple[float, float, float, float, int]:
+        """
+        Get detailed temperature status.
+
+        Returns
+        -------
+        sensor_temp : float
+            Current sensor temperature in degrees Celsius.
+        target_temp : float
+            Target temperature in degrees Celsius.
+        ambient_temp : float
+            Ambient temperature in degrees Celsius.
+        cooler_volts : float
+            Cooler voltage (indicates cooling effort).
+        status_code : int
+            Temperature status code.
+        """
+        sensor = c_float()
+        target = c_float()
+        ambient = c_float()
+        volts = c_float()
+        code = _lib.GetTemperatureStatus(byref(sensor), byref(target), byref(ambient), byref(volts))
+        return (sensor.value, target.value, ambient.value, volts.value, code)
 
     def get_temperature_range(self) -> Tuple[int, int]:
         """Get valid temperature range (min, max) in degrees Celsius."""
@@ -2880,6 +2907,15 @@ class SimulatedCamera:
                 return (self._temperature, ErrorCode.DRV_TEMPERATURE_STABILIZED)
         else:
             return (self._temperature, ErrorCode.DRV_TEMPERATURE_OFF)
+
+    def get_temperature_status(self) -> Tuple[float, float, float, float, int]:
+        # Get base temperature info
+        _, status = self.get_temperature()
+        # Simulate cooler voltage based on cooling effort
+        diff = abs(self._temperature - self._target_temperature)
+        volts = min(8.0, diff * 0.1) if self._cooler_on else 0.0
+        ambient = 22.0  # Simulated ambient
+        return (self._temperature, float(self._target_temperature), ambient, volts, status)
 
     def get_temperature_range(self) -> Tuple[int, int]:
         return (-100, 20)
