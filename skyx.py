@@ -188,9 +188,12 @@ class sky6RASCOMTele(object):
     def is_connected(self):
         ''' Returns True if the telescope is connected, False otherwise.
         '''
-        command = "var Out = sky6RASCOMTele.IsConnected;"
-        output = self.conn._send(command).splitlines()[0]
-        return int(output) == 1
+        try:
+            command = "var Out = sky6RASCOMTele.IsConnected;"
+            output = self.conn._send(command).splitlines()[0]
+            return int(output) == 1
+        except (ValueError, IndexError):
+            return False
 
     def is_parked(self):
         ''' Returns True if the telescope is parked, False otherwise.

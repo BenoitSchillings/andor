@@ -144,23 +144,18 @@ class CameraWorker(QObject):
 
             last_image_index = 0
             while self.running:
-                # Check if there are new images
-                try:
-                    first, last = self.camera.get_number_new_images()
-                    if last > last_image_index:
-                        # New frame available
-                        frame = self.camera.get_latest_frame()
-                        if frame is not None:
-                            self.new_frame_ready.emit(frame)
-                            last_image_index = last
-                        time.sleep(0.001)
-                    else:
-                        # No new frame, wait a bit
-                        time.sleep(0.001)
-                except Exception as e:
-                    # Log and fallback if get_number_new_images fails
-                    print(f"Frame error: {e}")
-                    time.sleep(0.01)
+                # Check if there are new images using image index
+                first, last = self.camera.get_number_new_images()
+                if last > last_image_index:
+                    # New frame available
+                    frame = self.camera.get_latest_frame()
+                    if frame is not None:
+                        self.new_frame_ready.emit(frame)
+                        last_image_index = last
+                    time.sleep(0.001)
+                else:
+                    # No new frame yet, wait a bit
+                    time.sleep(0.005)
 
                 # Update temperature periodically
                 if hasattr(self, '_temp_counter'):
@@ -522,14 +517,14 @@ class AndorUI:
         # Setup click handler
         self.imv.getImageItem().mouseClickEvent = self.on_click
 
+        # Restore cooler state from saved config (before starting acquisition)
+        self._restore_cooler_state()
+
         # Setup worker thread
         self._setup_worker()
 
         # Timing
         self.t0 = time.perf_counter()
-
-        # Restore cooler state from saved config
-        self._restore_cooler_state()
 
         # Apply command line display options
         self._apply_startup_options()
@@ -674,8 +669,6 @@ class AndorUI:
         self.data_dir_edit = QtWidgets.QLineEdit(getattr(self.args, 'data_dir', '.'))
         self.data_dir_edit.setFixedWidth(150)
         data_layout.addWidget(self.data_dir_edit)
-        self.disk_space_label = QtWidgets.QLabel("Disk: --")
-        data_layout.addWidget(self.disk_space_label)
         data_layout.addStretch()
         right_widget.layout().addWidget(data_row)
 
@@ -723,7 +716,7 @@ class AndorUI:
         self.worker = CameraWorker(self.camera)
         self.worker.exposure_time = self.args.exp
         self.worker.em_gain = self.args.gain
-        self.worker.video_mode = self.args.exp < 1.0
+        self.worker.video_mode = self.args.exp < 1.0  # Video mode for short exposures
         self.exposure_progress.video_mode = self.worker.video_mode
         self.worker.moveToThread(self.thread)
 
@@ -915,13 +908,6 @@ class AndorUI:
     def toggle_capture(self):
         """Toggle capture on/off."""
         if not self.capture_state:
-            # Check disk space before starting
-            can_capture, msg = self._check_disk_space()
-            if not can_capture:
-                print(f"[CAPTURE] Cannot start: {msg}")
-                QtWidgets.QMessageBox.warning(self.win, "Disk Space", msg)
-                return
-
             # Start or resume session
             if not self.session_active:
                 self._start_session()
@@ -1027,36 +1013,6 @@ class AndorUI:
             summary = self.session.end_session(notes)
             self.session_active = False
             print(f"[SESSION] Ended: {summary.get('total_frames', 0)} frames, {summary.get('total_size_mb', 0):.1f} MB")
-
-    def _check_disk_space(self) -> tuple:
-        """Check disk space and return (can_proceed, message)."""
-        # Update session base path from UI
-        self.session.base_path = Path(self.data_dir_edit.text()).resolve()
-
-        # Check if we have a batch target for size estimation
-        if self.batch_capture_target > 0:
-            return self.session.can_capture(self.batch_capture_target, self.sx, self.sy)
-        else:
-            # Just check available space
-            available_gb, status = self.session.check_disk_space()
-            if status == "critical":
-                return (False, f"Critical: only {available_gb:.1f} GB available")
-            elif status == "warning":
-                return (True, f"Warning: only {available_gb:.1f} GB available")
-            return (True, f"OK: {available_gb:.1f} GB available")
-
-    def _update_disk_space_display(self):
-        """Update the disk space label."""
-        available_gb, status = self.session.check_disk_space()
-        if status == "critical":
-            self.disk_space_label.setText(f"Disk: {available_gb:.0f}GB ⚠️")
-            self.disk_space_label.setStyleSheet("color: red;")
-        elif status == "warning":
-            self.disk_space_label.setText(f"Disk: {available_gb:.0f}GB")
-            self.disk_space_label.setStyleSheet("color: orange;")
-        else:
-            self.disk_space_label.setText(f"Disk: {available_gb:.0f}GB")
-            self.disk_space_label.setStyleSheet("")
 
     def apply_calibration(self, frame):
         """Apply dark subtraction and flat field correction."""
@@ -1179,8 +1135,6 @@ class AndorUI:
         self.temperature = sensor
         self.temp_status = status
         self.temp_label.setText(f"{sensor:.1f} °C ({status})")
-        # Update disk space periodically (piggyback on temp updates)
-        self._update_disk_space_display()
 
     def update_display(self):
         """Update the image display and stats."""
@@ -1352,9 +1306,11 @@ class AndorUI:
                     config = json.load(f)
                 self._saved_target_temp = config.get('target_temp', -60)
                 self._saved_cooler_on = config.get('cooler_on', False)
-                print(f"Loaded config: target={self._saved_target_temp}°C, cooler={'ON' if self._saved_cooler_on else 'OFF'}")
+                print(f"[CONFIG] Loaded: target={self._saved_target_temp}°C, cooler={'ON' if self._saved_cooler_on else 'OFF'}", flush=True)
+            else:
+                print(f"[CONFIG] No config file found at {CONFIG_FILE}", flush=True)
         except Exception as e:
-            print(f"Could not load config: {e}")
+            print(f"[CONFIG] Could not load config: {e}", flush=True)
 
     def _save_config(self):
         """Save current configuration."""
@@ -1371,16 +1327,22 @@ class AndorUI:
 
     def _restore_cooler_state(self):
         """Restore cooler state from saved config (called after UI is ready)."""
+        print(f"[COOLER] Restoring state: saved_on={self._saved_cooler_on}, saved_temp={self._saved_target_temp}", flush=True)
+
         # Set target temperature from saved config
         self.target_temp_spinbox.setValue(self._saved_target_temp)
         self.camera.set_temperature(self._saved_target_temp)
 
-        # Restore cooler state if it was on
+        # Always turn on cooler if saved state says it should be on
         if self._saved_cooler_on:
+            print(f"[COOLER] Turning on cooler to {self._saved_target_temp}°C", flush=True)
             self.camera.cooler_on()
             self.cooler_is_on = True
             self.cooler_button.setText("Cooler ON")
-            print(f"Restored cooler to {self._saved_target_temp}°C")
+            actual_state = self.camera.is_cooler_on()
+            print(f"[COOLER] Cooler started, is_on={actual_state}", flush=True)
+            if not actual_state:
+                print("[COOLER] WARNING: cooler_on() called but is_cooler_on() returns False!", flush=True)
 
     def _apply_startup_options(self):
         """Apply command line options after UI is ready."""
@@ -1829,8 +1791,8 @@ Keyboard shortcuts:
                         help="Base directory for data (default: current dir)")
 
     # Batch/scripted capture mode
-    parser.add_argument("--capture", type=int, default=500000, metavar="N",
-                        help="Capture N total frames then exit (default: 500000)")
+    parser.add_argument("--capture", type=int, default=20000, metavar="N",
+                        help="Capture N total frames then exit (default: 20000)")
     parser.add_argument("--auto-start", action="store_true",
                         help="Start capturing immediately on startup")
     parser.add_argument("--wait-temp", action="store_true",

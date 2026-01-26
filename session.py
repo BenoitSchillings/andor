@@ -5,7 +5,7 @@ Handles:
 - Directory structure (date/target/)
 - Session logging (session.json)
 - Disk space monitoring
-"""
+"""f
 
 import os
 import json
@@ -22,7 +22,7 @@ class SessionManager:
     WARNING_THRESHOLD_GB = 50
     CRITICAL_THRESHOLD_GB = 10
 
-    def __init__(self, base_path: str = "."):
+    def __init__(self, base_path: str = "./"):
         """
         Initialize session manager.
 

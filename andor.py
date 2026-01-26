@@ -889,30 +889,36 @@ class AndorCamera:
         self._camera_index = camera_index
 
         # Get camera handle if multiple cameras
+        print("init")
         num_cameras = get_available_cameras()
+        print(num_cameras)
         if camera_index >= num_cameras:
             raise AndorError(
                 ErrorCode.DRV_ERROR_NOCAMERA,
                 f"Camera index {camera_index} out of range (0-{num_cameras-1})"
             )
 
+        print("x1")
         if num_cameras > 1:
             _check_error(
                 _lib.GetCameraHandle(at_32(camera_index), byref(self._handle)),
                 "GetCameraHandle"
             )
             _check_error(_lib.SetCurrentCamera(self._handle), "SetCurrentCamera")
-
+        print("x05")
         # Initialize
         init_path = init_dir.encode() if init_dir else b""
+        print("x06")
         code = _lib.Initialize(init_path)
+        print("x07")
         _check_error(code, "Initialize")
         self._initialized = True
-
+        print("x2")
         # Get detector size
         width = c_int()
         height = c_int()
         _check_error(_lib.GetDetector(byref(width), byref(height)), "GetDetector")
+        print("x3")
         self._width = width.value
         self._height = height.value
 
@@ -1419,10 +1425,10 @@ class AndorCamera:
         """Get range of new images available (first, last)."""
         first = at_32()
         last = at_32()
-        _check_error(
-            _lib.GetNumberNewImages(byref(first), byref(last)),
-            "GetNumberNewImages"
-        )
+        code = _lib.GetNumberNewImages(byref(first), byref(last))
+        if code == ErrorCode.DRV_NO_NEW_DATA:
+            return (0, 0)  # No new data yet, not an error
+        _check_error(code, "GetNumberNewImages")
         return (first.value, last.value)
 
     def get_images(
